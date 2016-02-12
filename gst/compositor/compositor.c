@@ -244,10 +244,13 @@ _mixer_pad_get_output_size (GstCompositor * comp,
       GST_VIDEO_INFO_PAR_D (&vagg_pad->info),
       GST_VIDEO_INFO_PAR_N (&vagg->info), GST_VIDEO_INFO_PAR_D (&vagg->info)
       );
-  GST_LOG_OBJECT (comp_pad, "scaling %ux%u by %u/%u (%u/%u / %u/%u)", pad_width,
+
+  GST_LOG_OBJECT (comp_pad,
+      "scaling %ux%u by %u/%u (%u/%u / %u/%u) ow=%d, oh=%d", pad_width,
       pad_height, dar_n, dar_d, GST_VIDEO_INFO_PAR_N (&vagg_pad->info),
       GST_VIDEO_INFO_PAR_D (&vagg_pad->info),
-      GST_VIDEO_INFO_PAR_N (&vagg->info), GST_VIDEO_INFO_PAR_D (&vagg->info));
+      GST_VIDEO_INFO_PAR_N (&vagg->info), GST_VIDEO_INFO_PAR_D (&vagg->info),
+      GST_VIDEO_INFO_WIDTH (&vagg->info), GST_VIDEO_INFO_HEIGHT (&vagg->info));
 
   if (pad_height % dar_n == 0) {
     pad_width = gst_util_uint64_scale_int (pad_height, dar_n, dar_d);
@@ -292,6 +295,7 @@ gst_compositor_pad_set_info (GstVideoAggregatorPad * pad,
       gst_video_colorimetry_to_string (&(wanted_info->colorimetry));
   best_chroma = gst_video_chroma_to_string (wanted_info->chroma_site);
 
+  GST_TRACE ("@rentao");
   _mixer_pad_get_output_size (comp, cpad, &width, &height);
 
   if (GST_VIDEO_INFO_FORMAT (wanted_info) !=
@@ -403,6 +407,7 @@ gst_compositor_pad_prepare_frame (GstVideoAggregatorPad * pad,
    *     width/height. See ->set_info()
    * */
 
+  GST_TRACE ("@rentao");
   _mixer_pad_get_output_size (comp, cpad, &width, &height);
 
   /* The only thing that can change here is the width
@@ -498,6 +503,7 @@ gst_compositor_pad_prepare_frame (GstVideoAggregatorPad * pad,
     GstCompositorPad *cpad2 = GST_COMPOSITOR_PAD (pad2);
     gint pad2_width, pad2_height;
 
+    GST_TRACE ("@rentao");
     _mixer_pad_get_output_size (comp, cpad2, &pad2_width, &pad2_height);
 
     /* We don't need to clamp the coords of the second rectangle */
@@ -656,7 +662,9 @@ gst_compositor_pad_init (GstCompositorPad * compo_pad)
 enum
 {
   PROP_0,
-  PROP_BACKGROUND
+  PROP_BACKGROUND,
+  PROP_WIDTH,
+  PROP_HEIGHT
 };
 
 #define GST_TYPE_COMPOSITOR_BACKGROUND (gst_compositor_background_get_type())
@@ -692,6 +700,12 @@ gst_compositor_get_property (GObject * object,
     case PROP_BACKGROUND:
       g_value_set_enum (value, self->background);
       break;
+    case PROP_WIDTH:
+      g_value_set_int (value, self->output_width);
+      break;
+    case PROP_HEIGHT:
+      g_value_set_int (value, self->output_height);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -707,6 +721,12 @@ gst_compositor_set_property (GObject * object,
   switch (prop_id) {
     case PROP_BACKGROUND:
       self->background = g_value_get_enum (value);
+      break;
+    case PROP_WIDTH:
+      self->output_width = g_value_get_int (value);
+      break;
+    case PROP_HEIGHT:
+      self->output_height = g_value_get_int (value);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -889,6 +909,7 @@ _update_caps (GstVideoAggregator * vagg, GstCaps * caps)
   gint best_width = -1, best_height = -1;
   GstVideoInfo info;
   GstCaps *ret = NULL;
+  gint output_width = -1, output_height = -1;
 
   gst_video_info_from_caps (&info, caps);
 
@@ -902,6 +923,7 @@ _update_caps (GstVideoAggregator * vagg, GstCaps * caps)
     gint this_width, this_height;
     gint width, height;
 
+    GST_TRACE ("@rentao");
     _mixer_pad_get_output_size (GST_COMPOSITOR (vagg), compositor_pad, &width,
         &height);
 
@@ -916,9 +938,20 @@ _update_caps (GstVideoAggregator * vagg, GstCaps * caps)
     if (best_height < this_height)
       best_height = this_height;
   }
+  g_object_get (G_OBJECT (vagg), "width", &output_width, "height",
+      &output_height, NULL);
   GST_OBJECT_UNLOCK (vagg);
 
+  GST_TRACE
+      ("@rentao best-width=%d, best-height=%d, ow=%d, oh=%d, o_w=%d, o_h=%d",
+      best_width, best_height, GST_VIDEO_INFO_WIDTH (&vagg->info),
+      GST_VIDEO_INFO_HEIGHT (&vagg->info), output_width, output_height);
+
   if (best_width > 0 && best_height > 0) {
+    if (best_width > output_width && output_width > 0)
+      best_width = output_width;
+    if (best_width > output_height && output_height > 0)
+      best_height = output_height;
     info.width = best_width;
     info.height = best_height;
     if (set_functions (GST_COMPOSITOR (vagg), &info))
@@ -1067,6 +1100,15 @@ gst_compositor_class_init (GstCompositorClass * klass)
           GST_TYPE_COMPOSITOR_BACKGROUND,
           DEFAULT_BACKGROUND, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (gobject_class, PROP_WIDTH,
+      g_param_spec_int ("width", "Width",
+          "Fixed width of output screen (0 = expandable by the content)",
+          0, G_MAXINT, 0, G_PARAM_READWRITE));
+  g_object_class_install_property (gobject_class, PROP_HEIGHT,
+      g_param_spec_int ("height", "Height",
+          "Fixed height of output screen (0 = expandable by the content)",
+          0, G_MAXINT, 0, G_PARAM_READWRITE));
+
   gst_element_class_add_pad_template (gstelement_class,
       gst_static_pad_template_get (&src_factory));
   gst_element_class_add_pad_template (gstelement_class,
@@ -1093,6 +1135,7 @@ plugin_init (GstPlugin * plugin)
 
   gst_compositor_init_blend ();
 
+  GST_TRACE ("@rentao");
   return gst_element_register (plugin, "compositor", GST_RANK_PRIMARY + 1,
       GST_TYPE_COMPOSITOR);
 }

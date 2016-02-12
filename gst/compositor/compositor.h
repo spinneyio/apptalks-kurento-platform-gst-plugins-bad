@@ -69,6 +69,8 @@ struct _GstCompositor
 {
   GstVideoAggregator videoaggregator;
   GstCompositorBackground background;
+  gint output_width;
+  gint output_height;
 
   BlendFunction blend, overlay;
   FillCheckerFunction fill_checker;
