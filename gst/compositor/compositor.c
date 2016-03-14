@@ -222,6 +222,7 @@ _mixer_pad_get_output_size (GstCompositor * comp,
   GstVideoAggregatorPad *vagg_pad = GST_VIDEO_AGGREGATOR_PAD (comp_pad);
   gint pad_width, pad_height;
   guint dar_n, dar_d;
+  gint output_width = -1, output_height = -1;
 
   /* FIXME: Anything better we can do here? */
   if (!vagg_pad->info.finfo
@@ -259,6 +260,16 @@ _mixer_pad_get_output_size (GstCompositor * comp,
   } else {
     pad_width = gst_util_uint64_scale_int (pad_height, dar_n, dar_d);
   }
+
+  g_object_get (G_OBJECT (vagg), "width", &output_width, "height",
+      &output_height, NULL);
+  GST_LOG_OBJECT (comp_pad,
+      "pad width x height=%ux%u, output width x height = %ux%u", pad_width,
+      pad_height, output_width, output_height);
+  if (pad_width > output_width)
+    pad_width = output_width;
+  if (pad_height > output_height)
+    pad_height = output_height;
 
   if (width)
     *width = pad_width;
