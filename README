@@ -1,3 +1,30 @@
+HOW TO BUILD
+-------------
+git clone git@github.com:swarmnyc/gst-plugins-bad.git -b swarm_composite_6.2
+cd gst-plugins-bad/
+sudo apt-get install autopoint
+./autogen.sh # will got some error when this script start the configure automantically, ignore it and run below.
+./configure
+make
+
+HOW TO INSTALL
+-------------
+Copy the libgstcompositor.so to the system folder, e.g.
+  sudo cp gst/compositor/.libs/libgstcompositor.so /usr/lib/x86_64-linux-gnu/gstreamer-1.5/
+Restart the kurento service.
+
+HOW TO COMMIT
+--------------
+# run below to make git commit happy.
+indent --braces-on-if-line   --case-brace-indentation0   --case-indentation2 \
+    --braces-after-struct-decl-line   --line-length80   --no-tabs   --cuddle-else \
+    --dont-line-up-parentheses   --continuation-indentation4   --honour-newlines \
+    --tab-size8   --indent-level2   --leave-preprocessor-space  <c file(s) you have modified>
+git add <c file(s) you have modified>
+git commit
+
+
+
 GStreamer 1.7.x development series
 
 WHAT IT IS
