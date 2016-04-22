@@ -114,6 +114,7 @@
 
 #include "compositor.h"
 #include "compositorpad.h"
+#include <opencv/cv.h>
 
 #ifdef DISABLE_ORC
 #define orc_memset memset
@@ -154,6 +155,22 @@ enum
   PROP_PAD_HEIGHT,
   PROP_PAD_ALPHA
 };
+//
+// PROP_PAD_WIDTH: the view width of the pad show on the compositor output screen.
+// PROP_PAD_HEIGHT: the view height of the pad show on the compositor output screen.
+// GST_VIDEO_INFO_WIDTH (&vagg_pad->info): the width of the source video in the pad.
+// GST_VIDEO_INFO_HEIGHT (&vagg_pad->info): the height of the source video in the pad.
+
+// resize the source views' resolution to full cover the output resolution and keep the ratio unchanged.
+#define SCALE_TO_JUST_FULL_COVER(sw, sh, ow, oh) \
+  if ((sw) * (oh) >= (sh) * (ow)) { \
+    sw = oh * sw / sh; \
+    sh = oh; \
+  } else { \
+    sh = ow * sh / sw; \
+    sw = ow; \
+  }
+
 
 G_DEFINE_TYPE (GstCompositorPad, gst_compositor_pad,
     GST_TYPE_VIDEO_AGGREGATOR_PAD);
@@ -232,7 +249,19 @@ _mixer_pad_get_output_size (GstCompositor * comp,
     *height = 0;
     return;
   }
+  // just return the resolution of the source video in the pad.
+  *width = GST_VIDEO_INFO_WIDTH (&vagg_pad->info);
+  *height = GST_VIDEO_INFO_HEIGHT (&vagg_pad->info);
+  return;
 
+  if (GST_VIDEO_INFO_PAR_D (&vagg_pad->info) != 1) {
+    GST_LOG_OBJECT (comp_pad,
+        "@rentao: force par from %u/%u to 1:1.",
+        GST_VIDEO_INFO_PAR_D (&vagg_pad->info),
+        GST_VIDEO_INFO_PAR_N (&vagg_pad->info));
+    GST_VIDEO_INFO_PAR_D (&vagg_pad->info) = 1;
+    GST_VIDEO_INFO_PAR_N (&vagg_pad->info) = 1;
+  }
   pad_width =
       comp_pad->width <=
       0 ? GST_VIDEO_INFO_WIDTH (&vagg_pad->info) : comp_pad->width;
@@ -306,8 +335,15 @@ gst_compositor_pad_set_info (GstVideoAggregatorPad * pad,
       gst_video_colorimetry_to_string (&(wanted_info->colorimetry));
   best_chroma = gst_video_chroma_to_string (wanted_info->chroma_site);
 
-  GST_TRACE ("@rentao");
+//  GST_TRACE ("@rentao");
   _mixer_pad_get_output_size (comp, cpad, &width, &height);
+  GST_LOG_OBJECT (cpad,
+      "scaling %ux%u by (%u/%u %ux%u / %u/%u) ow=%d, oh=%d", width,
+      height, GST_VIDEO_INFO_PAR_N (current_info),
+      GST_VIDEO_INFO_PAR_D (current_info),
+      GST_VIDEO_INFO_WIDTH (current_info), GST_VIDEO_INFO_HEIGHT (current_info),
+      GST_VIDEO_INFO_PAR_N (&vagg->info), GST_VIDEO_INFO_PAR_D (&vagg->info),
+      GST_VIDEO_INFO_WIDTH (&vagg->info), GST_VIDEO_INFO_HEIGHT (&vagg->info));
 
   if (GST_VIDEO_INFO_FORMAT (wanted_info) !=
       GST_VIDEO_INFO_FORMAT (current_info)
@@ -322,6 +358,7 @@ gst_compositor_pad_set_info (GstVideoAggregatorPad * pad,
      * and other relevant fields.
      */
     gst_video_info_set_format (&tmp_info, GST_VIDEO_INFO_FORMAT (wanted_info),
+//      GST_VIDEO_INFO_WIDTH (current_info), GST_VIDEO_INFO_HEIGHT (current_info));
         width, height);
     tmp_info.chroma_site = wanted_info->chroma_site;
     tmp_info.colorimetry = wanted_info->colorimetry;
@@ -959,9 +996,9 @@ _update_caps (GstVideoAggregator * vagg, GstCaps * caps)
       GST_VIDEO_INFO_HEIGHT (&vagg->info), output_width, output_height);
 
   if (best_width > 0 && best_height > 0) {
-    if (best_width > output_width && output_width > 0)
+    if (best_width != output_width && output_width > 0)
       best_width = output_width;
-    if (best_width > output_height && output_height > 0)
+    if (best_width != output_height && output_height > 0)
       best_height = output_height;
     info.width = best_width;
     info.height = best_height;
@@ -975,6 +1012,99 @@ _update_caps (GstVideoAggregator * vagg, GstCaps * caps)
   return ret;
 }
 
+static IplImage *
+YUV420_To_IplImage_Opencv (unsigned char *pYUV420, int width, int height)
+{
+  IplImage *yuvimage, *rgbimg, *yimg, *uimg, *vimg, *uuimg, *vvimg;
+
+  int nWidth = width;
+  int nHeight = height;
+
+  if (!pYUV420) {
+    return NULL;
+  }
+
+  rgbimg = cvCreateImage (cvSize (nWidth, nHeight), IPL_DEPTH_8U, 3);
+  yuvimage = cvCreateImage (cvSize (nWidth, nHeight), IPL_DEPTH_8U, 3);
+
+  yimg = cvCreateImageHeader (cvSize (nWidth, nHeight), IPL_DEPTH_8U, 1);
+  uimg =
+      cvCreateImageHeader (cvSize (nWidth / 2, nHeight / 2), IPL_DEPTH_8U, 1);
+  vimg =
+      cvCreateImageHeader (cvSize (nWidth / 2, nHeight / 2), IPL_DEPTH_8U, 1);
+
+  uuimg = cvCreateImage (cvSize (nWidth, nHeight), IPL_DEPTH_8U, 1);
+  vvimg = cvCreateImage (cvSize (nWidth, nHeight), IPL_DEPTH_8U, 1);
+
+  cvSetData (yimg, pYUV420, nWidth);
+  cvSetData (uimg, pYUV420 + nWidth * nHeight, nWidth / 2);
+  cvSetData (vimg, pYUV420 + (long) (nWidth * nHeight * 1.25), nWidth / 2);
+  cvResize (uimg, uuimg, CV_INTER_LINEAR);
+  cvResize (vimg, vvimg, CV_INTER_LINEAR);
+
+  cvMerge (yimg, uuimg, vvimg, NULL, yuvimage);
+  cvCvtColor (yuvimage, rgbimg, CV_YCrCb2RGB);
+
+  cvReleaseImage (&uuimg);
+  cvReleaseImage (&vvimg);
+  cvReleaseImageHeader (&yimg);
+  cvReleaseImageHeader (&uimg);
+  cvReleaseImageHeader (&vimg);
+
+  cvReleaseImage (&yuvimage);
+
+  if (!rgbimg) {
+    return NULL;
+  }
+
+  return rgbimg;
+}
+
+static IplImage *
+cvCreateImageByVideoFrame (GstVideoFrame * vframe)
+{
+  IplImage *retImg;
+  guint8 *pixels = GST_VIDEO_FRAME_PLANE_DATA (vframe, 0);
+  if (vframe->info.width * 3 == vframe->info.size / vframe->info.height * 2) {
+    // seems a YUV image.
+    GST_DEBUG ("@rentao opencv, YUV->RGB image=%dx%d size=%ld",
+        vframe->info.width, vframe->info.height, vframe->info.size);
+    return YUV420_To_IplImage_Opencv (pixels, vframe->info.width,
+        vframe->info.height);
+  }
+  retImg = cvCreateImage (cvSize (vframe->info.width, vframe->info.height),
+      IPL_DEPTH_8U, 3);
+  GST_DEBUG ("@rentao opencv, image=%dx%d size=%ld", vframe->info.width,
+      vframe->info.height, vframe->info.size);
+  retImg->imageData = (char *) pixels;
+  return retImg;
+}
+
+static gboolean
+_compositor_fit_srcframe_into_view (gint sw, gint sh, gint vw, gint vh,
+    CvRect * pRect)
+{
+  if (vw > sw || vh > sh) {
+    int ow = sw;
+    int oh = sh;
+    int wx, hx;
+    SCALE_TO_JUST_FULL_COVER (ow, oh, vw, vh);
+    wx = (ow - vw) * sw / ow;
+    hx = (oh - vh) * sh / oh;
+    pRect->x = wx / 2;
+    pRect->width = vw * sw / ow;
+    pRect->y = hx / 2;
+    pRect->height = vh * sh / oh;
+    return TRUE;
+  }
+  // blend at the center.
+  pRect->x = (sw - vw) / 2;
+  pRect->width = vw;
+  pRect->y = (sh - vh) / 2;
+  pRect->height = vh;
+  return FALSE;
+}
+
 static GstFlowReturn
 gst_compositor_aggregate_frames (GstVideoAggregator * vagg, GstBuffer * outbuf)
 {
@@ -982,6 +1112,8 @@ gst_compositor_aggregate_frames (GstVideoAggregator * vagg, GstBuffer * outbuf)
   GstCompositor *self = GST_COMPOSITOR (vagg);
   BlendFunction composite;
   GstVideoFrame out_frame, *outframe;
+//  GstVideoFrame pad_frame;
+  IplImage *retFrame;
 
   if (!gst_video_frame_map (&out_frame, &vagg->info, outbuf, GST_MAP_WRITE)) {
     GST_WARNING_OBJECT (vagg, "Could not map output buffer");
@@ -1030,15 +1162,76 @@ gst_compositor_aggregate_frames (GstVideoAggregator * vagg, GstBuffer * outbuf)
   }
 
   GST_OBJECT_LOCK (vagg);
+  retFrame = cvCreateImageByVideoFrame (outframe);
   for (l = GST_ELEMENT (vagg)->sinkpads; l; l = l->next) {
     GstVideoAggregatorPad *pad = l->data;
     GstCompositorPad *compo_pad = GST_COMPOSITOR_PAD (pad);
 
     if (pad->aggregated_frame != NULL) {
-      composite (pad->aggregated_frame, compo_pad->xpos, compo_pad->ypos,
-          compo_pad->alpha, outframe);
+      IplImage *src_frame;
+      CvSize src_size;
+      CvRect src_rect;
+      gboolean expand;
+
+      src_frame = cvCreateImageByVideoFrame (pad->aggregated_frame);
+      src_size = cvGetSize (src_frame);
+      GST_DEBUG
+          ("@rentao blend from src to tat (opencv). view=%dx%d @ (%d,%d) src=%dx%d",
+          compo_pad->width, compo_pad->height, compo_pad->xpos, compo_pad->ypos,
+          src_size.width, src_size.height);
+
+      cvSetImageROI (retFrame, cvRect (compo_pad->xpos, compo_pad->ypos,
+              compo_pad->width, compo_pad->height));
+      expand =
+          _compositor_fit_srcframe_into_view (src_size.width, src_size.height,
+          compo_pad->width, compo_pad->height, &src_rect);
+      cvSetImageROI (src_frame, src_rect);
+      if (expand == TRUE) {
+        cvResize (src_frame, retFrame, CV_INTER_LINEAR);
+      } else {
+        cvCopy (src_frame, retFrame, NULL);
+      }
+      cvReleaseImage (&src_frame);
+//      if (!gst_video_frame_map (&pad_frame, &pad->buffer_vinfo, pad->buffer,
+//              GST_MAP_READ)) {
+//        GST_WARNING_OBJECT (vagg, "Could not map input buffer");
+//        return FALSE;
+//      }
+//      src_frame = cvCreateImageByVideoFrame(&pad_frame);
+//      cvSetImageROI (src_frame, cvRect (0, 60, 648, 360));
+//      cvResize (src_frame, retFrame, CV_INTER_LINEAR);
+//      cvReleaseImage (&src_frame);
+//      gst_video_frame_unmap (&pad_frame);
+
+      if (1 == 0)
+        composite (pad->aggregated_frame, compo_pad->xpos, compo_pad->ypos,
+            compo_pad->alpha, outframe);
     }
   }
+  cvReleaseImage (&retFrame);
+//  GST_DEBUG("@rentao try to use opencv start.");
+//  if (1==0) {
+//    IplImage *outputImg;
+//    guint8 *pixels = GST_VIDEO_FRAME_PLANE_DATA (outframe, 0);
+//    guint stride = GST_VIDEO_FRAME_PLANE_STRIDE (outframe, 0);
+////    guint pixel_stride = GST_VIDEO_FRAME_PLANE_PSTRIDE (outframe, 0);
+//    GST_DEBUG("@rentao try to use opencv start. %d", stride);
+////    GstMapInfo info;
+//    GST_DEBUG("@rentao try to use opencv.");
+////    gst_buffer_map (outframe->buffer, &info, GST_MAP_READ);
+////    GST_DEBUG("@rentao try to use opencv. %d, %d", outframe->info.width, outframe->info.height);
+//    outputImg = cvCreateImage (cvSize (outframe->info.width, outframe->info.height),
+//            IPL_DEPTH_8U, 3);
+//    GST_DEBUG("@rentao try to use opencv.");
+//    outputImg->imageData = (char *) pixels/*outframe->data*/;
+////    GST_DEBUG("@rentao try to use opencv.");
+//    cvRectangle(outputImg, cvPoint(110,110), cvPoint(600, 700), CV_RGB (0,0,0), CV_FILLED, 8, 0);
+////    GST_DEBUG("@rentao try to use opencv.");
+//    cvReleaseImage (&outputImg);
+////    gst_buffer_unmap (outframe->buffer, &info);
+//  }
+//  GST_TRACE("@rentao try to use opencv. end");
+
   GST_OBJECT_UNLOCK (vagg);
 
   gst_video_frame_unmap (outframe);
