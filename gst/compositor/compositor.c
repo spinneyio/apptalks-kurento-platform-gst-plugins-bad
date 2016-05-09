@@ -115,6 +115,7 @@
 #include "compositor.h"
 #include "compositorpad.h"
 #include <opencv/cv.h>
+#include <opencv/highgui.h>
 
 #ifdef DISABLE_ORC
 #define orc_memset memset
@@ -696,6 +697,20 @@ gst_compositor_pad_class_init (GstCompositorPadClass * klass)
       GST_DEBUG_FUNCPTR (gst_compositor_pad_clean_frame);
 }
 
+#define GST_COMPOSITOR_GET_PRIVATE(obj) (\
+  G_TYPE_INSTANCE_GET_PRIVATE (               \
+    (obj),                                    \
+    GST_TYPE_COMPOSITOR,                 \
+    GstCompositorPrivate                  \
+  )                                           \
+)
+
+typedef struct _GstCompositorPrivate
+{
+  IplImage *cvBackgroundImage;
+  IplImage *cvBackgroundImageReady2Copy;
+} GstCompositorPrivate;
+
 static void
 gst_compositor_pad_init (GstCompositorPad * compo_pad)
 {
@@ -712,8 +727,10 @@ enum
   PROP_0,
   PROP_BACKGROUND,
   PROP_WIDTH,
-  PROP_HEIGHT
+  PROP_HEIGHT,
+  PROP_BACKGROUND_IMAGE
 };
+#define DEFAULT_BACKGROUND_IMAGE NULL
 
 #define GST_TYPE_COMPOSITOR_BACKGROUND (gst_compositor_background_get_type())
 static GType
@@ -754,6 +771,11 @@ gst_compositor_get_property (GObject * object,
     case PROP_HEIGHT:
       g_value_set_int (value, self->output_height);
       break;
+    case PROP_BACKGROUND_IMAGE:
+    {
+      g_value_set_string (value, self->background_image);
+      break;
+    }
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -775,6 +797,19 @@ gst_compositor_set_property (GObject * object,
       break;
     case PROP_HEIGHT:
       self->output_height = g_value_get_int (value);
+      break;
+    case PROP_BACKGROUND_IMAGE:
+      GST_OBJECT_LOCK (self);
+      g_free (self->background_image);
+      self->background_image = g_value_dup_string (value);
+      if (self->priv->cvBackgroundImage != NULL)
+        cvReleaseImage (&self->priv->cvBackgroundImage);
+      self->priv->cvBackgroundImage =
+          cvLoadImage (self->background_image,
+          CV_LOAD_IMAGE_COLOR /*ignore alpha channel */ );
+      GST_OBJECT_UNLOCK (self);
+      GST_INFO ("@rentao set background-image file %s ok.",
+          self->background_image);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -1110,7 +1145,7 @@ gst_compositor_aggregate_frames (GstVideoAggregator * vagg, GstBuffer * outbuf)
 {
   GList *l;
   GstCompositor *self = GST_COMPOSITOR (vagg);
-  BlendFunction composite;
+//  BlendFunction composite;
   GstVideoFrame out_frame, *outframe;
 //  GstVideoFrame pad_frame;
   IplImage *retFrame;
@@ -1122,47 +1157,61 @@ gst_compositor_aggregate_frames (GstVideoAggregator * vagg, GstBuffer * outbuf)
 
   outframe = &out_frame;
   /* default to blending */
-  composite = self->blend;
+//  composite = self->blend;
   /* TODO: If the frames to be composited completely obscure the background,
    * don't bother drawing the background at all. */
-  switch (self->background) {
-    case COMPOSITOR_BACKGROUND_CHECKER:
-      self->fill_checker (outframe);
-      break;
-    case COMPOSITOR_BACKGROUND_BLACK:
-      self->fill_color (outframe, 16, 128, 128);
-      break;
-    case COMPOSITOR_BACKGROUND_WHITE:
-      self->fill_color (outframe, 240, 128, 128);
-      break;
-    case COMPOSITOR_BACKGROUND_TRANSPARENT:
-    {
-      guint i, plane, num_planes, height;
-
-      num_planes = GST_VIDEO_FRAME_N_PLANES (outframe);
-      for (plane = 0; plane < num_planes; ++plane) {
-        guint8 *pdata;
-        gsize rowsize, plane_stride;
-
-        pdata = GST_VIDEO_FRAME_PLANE_DATA (outframe, plane);
-        plane_stride = GST_VIDEO_FRAME_PLANE_STRIDE (outframe, plane);
-        rowsize = GST_VIDEO_FRAME_COMP_WIDTH (outframe, plane)
-            * GST_VIDEO_FRAME_COMP_PSTRIDE (outframe, plane);
-        height = GST_VIDEO_FRAME_COMP_HEIGHT (outframe, plane);
-        for (i = 0; i < height; ++i) {
-          memset (pdata, 0, rowsize);
-          pdata += plane_stride;
-        }
+  if (self->priv->cvBackgroundImageReady2Copy == NULL) {
+    switch (self->background) {
+      case COMPOSITOR_BACKGROUND_CHECKER:
+        self->fill_checker (outframe);
+        break;
+      case COMPOSITOR_BACKGROUND_BLACK:
+        self->fill_color (outframe, 16, 128, 128);
+        break;
+      case COMPOSITOR_BACKGROUND_WHITE:
+        self->fill_color (outframe, 240, 128, 128);
+        break;
+      case COMPOSITOR_BACKGROUND_TRANSPARENT:{
+//      guint i, plane, num_planes, height;
+//
+//      num_planes = GST_VIDEO_FRAME_N_PLANES (outframe);
+//      for (plane = 0; plane < num_planes; ++plane) {
+//        guint8 *pdata;
+//        gsize rowsize, plane_stride;
+//
+//        pdata = GST_VIDEO_FRAME_PLANE_DATA (outframe, plane);
+//        plane_stride = GST_VIDEO_FRAME_PLANE_STRIDE (outframe, plane);
+//        rowsize = GST_VIDEO_FRAME_COMP_WIDTH (outframe, plane)
+//            * GST_VIDEO_FRAME_COMP_PSTRIDE (outframe, plane);
+//        height = GST_VIDEO_FRAME_COMP_HEIGHT (outframe, plane);
+//        for (i = 0; i < height; ++i) {
+//          memset (pdata, 0, rowsize);
+//          pdata += plane_stride;
+//        }
+//      }
+//
+//      /* use overlay to keep background transparent */
+//      composite = self->overlay;
+        break;
       }
-
-      /* use overlay to keep background transparent */
-      composite = self->overlay;
-      break;
     }
   }
-
   GST_OBJECT_LOCK (vagg);
   retFrame = cvCreateImageByVideoFrame (outframe);
+  if (self->priv->cvBackgroundImageReady2Copy == NULL
+      && self->priv->cvBackgroundImage != NULL) {
+    cvResize (self->priv->cvBackgroundImage, retFrame, CV_INTER_LINEAR);
+    // save the resized background image for future used.
+    if (self->priv->cvBackgroundImageReady2Copy != NULL)
+      cvReleaseImage (&self->priv->cvBackgroundImageReady2Copy);
+    self->priv->cvBackgroundImageReady2Copy =
+        cvCreateImage (cvGetSize (retFrame), retFrame->depth,
+        retFrame->nChannels);
+    cvCopy (retFrame, self->priv->cvBackgroundImageReady2Copy, NULL);
+  } else if (self->priv->cvBackgroundImageReady2Copy != NULL) {
+    cvCopy (self->priv->cvBackgroundImageReady2Copy, retFrame, NULL);
+  }
+
   for (l = GST_ELEMENT (vagg)->sinkpads; l; l = l->next) {
     GstVideoAggregatorPad *pad = l->data;
     GstCompositorPad *compo_pad = GST_COMPOSITOR_PAD (pad);
@@ -1203,9 +1252,9 @@ gst_compositor_aggregate_frames (GstVideoAggregator * vagg, GstBuffer * outbuf)
 //      cvReleaseImage (&src_frame);
 //      gst_video_frame_unmap (&pad_frame);
 
-      if (1 == 0)
-        composite (pad->aggregated_frame, compo_pad->xpos, compo_pad->ypos,
-            compo_pad->alpha, outframe);
+//      if (1 == 0)
+//        composite (pad->aggregated_frame, compo_pad->xpos, compo_pad->ypos,
+//            compo_pad->alpha, outframe);
     }
   }
   cvReleaseImage (&retFrame);
@@ -1281,6 +1330,21 @@ _sink_query (GstAggregator * agg, GstAggregatorPad * bpad, GstQuery * query)
   }
 }
 
+static void
+gst_compositor_finalize (GObject * object)
+{
+  GstCompositor *self = GST_COMPOSITOR (object);
+
+  if (self->priv->cvBackgroundImage != NULL)
+    cvReleaseImage (&self->priv->cvBackgroundImage);
+  if (self->priv->cvBackgroundImageReady2Copy != NULL)
+    cvReleaseImage (&self->priv->cvBackgroundImageReady2Copy);
+  self->priv->cvBackgroundImage = NULL;
+  self->priv->cvBackgroundImageReady2Copy = NULL;
+
+  G_OBJECT_CLASS (gst_compositor_parent_class)->finalize (object);
+}
+
 /* GObject boilerplate */
 static void
 gst_compositor_class_init (GstCompositorClass * klass)
@@ -1293,6 +1357,7 @@ gst_compositor_class_init (GstCompositorClass * klass)
 
   gobject_class->get_property = gst_compositor_get_property;
   gobject_class->set_property = gst_compositor_set_property;
+  gobject_class->finalize = gst_compositor_finalize;
 
   agg_class->sinkpads_type = GST_TYPE_COMPOSITOR_PAD;
   agg_class->sink_query = _sink_query;
@@ -1312,6 +1377,12 @@ gst_compositor_class_init (GstCompositorClass * klass)
       g_param_spec_int ("height", "Height",
           "Fixed height of output screen (0 = expandable by the content)",
           0, G_MAXINT, 0, G_PARAM_READWRITE));
+  g_object_class_install_property (gobject_class, PROP_BACKGROUND_IMAGE,
+      g_param_spec_string ("background-image",
+          "Background Image show at the episode",
+          "Background Image local file path",
+          DEFAULT_BACKGROUND_IMAGE,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   gst_element_class_add_pad_template (gstelement_class,
       gst_static_pad_template_get (&src_factory));
@@ -1322,13 +1393,22 @@ gst_compositor_class_init (GstCompositorClass * klass)
       "Filter/Editor/Video/Compositor",
       "Composite multiple video streams", "Wim Taymans <wim@fluendo.com>, "
       "Sebastian Dröge <sebastian.droege@collabora.co.uk>");
+
+  /* Registers a private structure for the instantiatable type */
+  g_type_class_add_private (klass, sizeof (GstCompositorPrivate));
+  GST_TRACE ("@rentao");
 }
 
 static void
 gst_compositor_init (GstCompositor * self)
 {
+  self->priv = GST_COMPOSITOR_GET_PRIVATE (self);
   self->background = DEFAULT_BACKGROUND;
+  self->background_image = NULL;
+  self->priv->cvBackgroundImage = NULL;
+  self->priv->cvBackgroundImageReady2Copy = NULL;
   /* initialize variables */
+  GST_TRACE ("@rentao");
 }
 
 /* Element registration */
