@@ -114,6 +114,8 @@
 
 #include "compositor.h"
 #include "compositorpad.h"
+#include <opencv/cv.h>
+#include <opencv/highgui.h>
 
 #ifdef DISABLE_ORC
 #define orc_memset memset
@@ -154,6 +156,22 @@ enum
   PROP_PAD_HEIGHT,
   PROP_PAD_ALPHA
 };
+//
+// PROP_PAD_WIDTH: the view width of the pad show on the compositor output screen.
+// PROP_PAD_HEIGHT: the view height of the pad show on the compositor output screen.
+// GST_VIDEO_INFO_WIDTH (&vagg_pad->info): the width of the source video in the pad.
+// GST_VIDEO_INFO_HEIGHT (&vagg_pad->info): the height of the source video in the pad.
+
+// resize the source views' resolution to full cover the output resolution and keep the ratio unchanged.
+#define SCALE_TO_JUST_FULL_COVER(sw, sh, ow, oh) \
+  if ((sw) * (oh) >= (sh) * (ow)) { \
+    sw = oh * sw / sh; \
+    sh = oh; \
+  } else { \
+    sh = ow * sh / sw; \
+    sw = ow; \
+  }
+
 
 G_DEFINE_TYPE (GstCompositorPad, gst_compositor_pad,
     GST_TYPE_VIDEO_AGGREGATOR_PAD);
@@ -214,6 +232,7 @@ gst_compositor_pad_set_property (GObject * object, guint prop_id,
   }
 }
 
+
 static void
 _mixer_pad_get_output_size (GstCompositor * comp,
     GstCompositorPad * comp_pad, gint out_par_n, gint out_par_d, gint * width,
@@ -231,6 +250,17 @@ _mixer_pad_get_output_size (GstCompositor * comp,
     *height = 0;
     return;
   }
+  // For swarmnyc's apptalks StyleCompositor.
+  // just return the resolution of the source video in the pad.
+  pad_width = *width;
+  pad_height = *height;
+  *width = GST_VIDEO_INFO_WIDTH (&vagg_pad->info);
+  *height = GST_VIDEO_INFO_HEIGHT (&vagg_pad->info);
+  GST_TRACE
+      ("@rentao return-width=%d, return-height=%d, pad_width=%d, pad_height=%d",
+      *width, *height, pad_width, pad_height);
+
+  return;
 
   pad_width =
       comp_pad->width <=
@@ -291,6 +321,13 @@ gst_compositor_pad_set_info (GstVideoAggregatorPad * pad,
 
   _mixer_pad_get_output_size (comp, cpad, GST_VIDEO_INFO_PAR_N (&vagg->info),
       GST_VIDEO_INFO_PAR_D (&vagg->info), &width, &height);
+  GST_LOG_OBJECT (cpad,
+      "scaling %ux%u by (%u/%u %ux%u / %u/%u) ow=%d, oh=%d", width,
+      height, GST_VIDEO_INFO_PAR_N (current_info),
+      GST_VIDEO_INFO_PAR_D (current_info),
+      GST_VIDEO_INFO_WIDTH (current_info), GST_VIDEO_INFO_HEIGHT (current_info),
+      GST_VIDEO_INFO_PAR_N (&vagg->info), GST_VIDEO_INFO_PAR_D (&vagg->info),
+      GST_VIDEO_INFO_WIDTH (&vagg->info), GST_VIDEO_INFO_HEIGHT (&vagg->info));
 
   if (GST_VIDEO_INFO_FORMAT (wanted_info) !=
       GST_VIDEO_INFO_FORMAT (current_info)
@@ -642,6 +679,20 @@ gst_compositor_pad_class_init (GstCompositorPadClass * klass)
       GST_DEBUG_FUNCPTR (gst_compositor_pad_clean_frame);
 }
 
+#define GST_COMPOSITOR_GET_PRIVATE(obj) (\
+  G_TYPE_INSTANCE_GET_PRIVATE (               \
+    (obj),                                    \
+    GST_TYPE_COMPOSITOR,                 \
+    GstCompositorPrivate                  \
+  )                                           \
+)
+
+typedef struct _GstCompositorPrivate
+{
+  IplImage *cvBackgroundImage;
+  IplImage *cvBackgroundImageReady2Copy;
+} GstCompositorPrivate;
+
 static void
 gst_compositor_pad_init (GstCompositorPad * compo_pad)
 {
@@ -656,8 +707,12 @@ gst_compositor_pad_init (GstCompositorPad * compo_pad)
 enum
 {
   PROP_0,
-  PROP_BACKGROUND
+  PROP_BACKGROUND,
+  PROP_WIDTH,
+  PROP_HEIGHT,
+  PROP_BACKGROUND_IMAGE
 };
+#define DEFAULT_BACKGROUND_IMAGE NULL
 
 #define GST_TYPE_COMPOSITOR_BACKGROUND (gst_compositor_background_get_type())
 static GType
@@ -692,6 +747,17 @@ gst_compositor_get_property (GObject * object,
     case PROP_BACKGROUND:
       g_value_set_enum (value, self->background);
       break;
+    case PROP_WIDTH:
+      g_value_set_int (value, self->output_width);
+      break;
+    case PROP_HEIGHT:
+      g_value_set_int (value, self->output_height);
+      break;
+    case PROP_BACKGROUND_IMAGE:
+    {
+      g_value_set_string (value, self->background_image);
+      break;
+    }
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -707,6 +773,25 @@ gst_compositor_set_property (GObject * object,
   switch (prop_id) {
     case PROP_BACKGROUND:
       self->background = g_value_get_enum (value);
+      break;
+    case PROP_WIDTH:
+      self->output_width = g_value_get_int (value);
+      break;
+    case PROP_HEIGHT:
+      self->output_height = g_value_get_int (value);
+      break;
+    case PROP_BACKGROUND_IMAGE:
+      GST_OBJECT_LOCK (self);
+      g_free (self->background_image);
+      self->background_image = g_value_dup_string (value);
+      if (self->priv->cvBackgroundImage != NULL)
+        cvReleaseImage (&self->priv->cvBackgroundImage);
+      self->priv->cvBackgroundImage =
+          cvLoadImage (self->background_image,
+          CV_LOAD_IMAGE_COLOR /*ignore alpha channel */ );
+      GST_OBJECT_UNLOCK (self);
+      GST_INFO ("@rentao set background-image file %s ok.",
+          self->background_image);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -893,6 +978,7 @@ _fixate_caps (GstVideoAggregator * vagg, GstCaps * caps)
   GstCaps *ret = NULL;
   GstStructure *s;
 
+  GST_DEBUG_OBJECT (vagg, "origin caps %" GST_PTR_FORMAT, caps);
   ret = gst_caps_make_writable (caps);
 
   /* we need this to calculate how large to make the output frame */
@@ -939,6 +1025,9 @@ _fixate_caps (GstVideoAggregator * vagg, GstCaps * caps)
       best_fps_n = fps_n;
       best_fps_d = fps_d;
     }
+    GST_TRACE
+        ("@rentao best-width=%d, best-height=%d, best_fps_n=%d, best_fps_d=%d",
+        best_width, best_height, best_fps_n, best_fps_d);
   }
   GST_OBJECT_UNLOCK (vagg);
 
@@ -947,6 +1036,9 @@ _fixate_caps (GstVideoAggregator * vagg, GstCaps * caps)
     best_fps_d = 1;
     best_fps = 25.0;
   }
+  // set best output resolution to the size StyleComposite had set.
+  g_object_get (G_OBJECT (vagg), "width", &best_width, "height",
+      &best_height, NULL);
 
   gst_structure_fixate_field_nearest_int (s, "width", best_width);
   gst_structure_fixate_field_nearest_int (s, "height", best_height);
@@ -954,6 +1046,10 @@ _fixate_caps (GstVideoAggregator * vagg, GstCaps * caps)
       best_fps_d);
   ret = gst_caps_fixate (ret);
 
+  GST_TRACE
+      ("@rentao final, best-width=%d, best-height=%d, best_fps_n=%d, best_fps_d=%d",
+      best_width, best_height, best_fps_n, best_fps_d);
+  GST_DEBUG_OBJECT (vagg, "final caps %" GST_PTR_FORMAT, ret);
   return ret;
 }
 
@@ -975,13 +1071,172 @@ _negotiated_caps (GstVideoAggregator * vagg, GstCaps * caps)
   return TRUE;
 }
 
+#if 0
+static GstCaps *
+_update_caps (GstVideoAggregator * vagg, GstCaps * caps)
+{
+  GList *l;
+  gint best_width = -1, best_height = -1;
+  GstVideoInfo info;
+  GstCaps *ret = NULL;
+  gint output_width = -1, output_height = -1;
+
+  gst_video_info_from_caps (&info, caps);
+
+  /* FIXME: this doesn't work for non 1/1 output par's as we don't have that
+   * information available at this time */
+
+  GST_OBJECT_LOCK (vagg);
+  for (l = GST_ELEMENT (vagg)->sinkpads; l; l = l->next) {
+    GstVideoAggregatorPad *vaggpad = l->data;
+    GstCompositorPad *compositor_pad = GST_COMPOSITOR_PAD (vaggpad);
+    gint this_width, this_height;
+    gint width, height;
+
+    GST_TRACE ("@rentao");
+    _mixer_pad_get_output_size (GST_COMPOSITOR (vagg), compositor_pad, &width,
+        &height);
+
+    if (width == 0 || height == 0)
+      continue;
+
+    this_width = width + MAX (compositor_pad->xpos, 0);
+    this_height = height + MAX (compositor_pad->ypos, 0);
+
+    if (best_width < this_width)
+      best_width = this_width;
+    if (best_height < this_height)
+      best_height = this_height;
+  }
+  g_object_get (G_OBJECT (vagg), "width", &output_width, "height",
+      &output_height, NULL);
+  GST_OBJECT_UNLOCK (vagg);
+
+  GST_TRACE
+      ("@rentao best-width=%d, best-height=%d, ow=%d, oh=%d, o_w=%d, o_h=%d",
+      best_width, best_height, GST_VIDEO_INFO_WIDTH (&vagg->info),
+      GST_VIDEO_INFO_HEIGHT (&vagg->info), output_width, output_height);
+
+  if (best_width > 0 && best_height > 0) {
+    if (best_width != output_width && output_width > 0)
+      best_width = output_width;
+    if (best_width != output_height && output_height > 0)
+      best_height = output_height;
+    info.width = best_width;
+    info.height = best_height;
+    if (set_functions (GST_COMPOSITOR (vagg), &info))
+      ret = gst_video_info_to_caps (&info);
+
+    gst_caps_set_simple (ret, "pixel-aspect-ratio", GST_TYPE_FRACTION_RANGE,
+        1, G_MAXINT, G_MAXINT, 1, NULL);
+  }
+
+  return ret;
+}
+#endif
+
+static IplImage *
+YUV420_To_IplImage_Opencv (unsigned char *pYUV420, int width, int height)
+{
+  IplImage *yuvimage, *rgbimg, *yimg, *uimg, *vimg, *uuimg, *vvimg;
+
+  int nWidth = width;
+  int nHeight = height;
+
+  if (!pYUV420) {
+    return NULL;
+  }
+
+  rgbimg = cvCreateImage (cvSize (nWidth, nHeight), IPL_DEPTH_8U, 3);
+  yuvimage = cvCreateImage (cvSize (nWidth, nHeight), IPL_DEPTH_8U, 3);
+
+  yimg = cvCreateImageHeader (cvSize (nWidth, nHeight), IPL_DEPTH_8U, 1);
+  uimg =
+      cvCreateImageHeader (cvSize (nWidth / 2, nHeight / 2), IPL_DEPTH_8U, 1);
+  vimg =
+      cvCreateImageHeader (cvSize (nWidth / 2, nHeight / 2), IPL_DEPTH_8U, 1);
+
+  uuimg = cvCreateImage (cvSize (nWidth, nHeight), IPL_DEPTH_8U, 1);
+  vvimg = cvCreateImage (cvSize (nWidth, nHeight), IPL_DEPTH_8U, 1);
+
+  cvSetData (yimg, pYUV420, nWidth);
+  cvSetData (uimg, pYUV420 + nWidth * nHeight, nWidth / 2);
+  cvSetData (vimg, pYUV420 + (long) (nWidth * nHeight * 1.25), nWidth / 2);
+  cvResize (uimg, uuimg, CV_INTER_LINEAR);
+  cvResize (vimg, vvimg, CV_INTER_LINEAR);
+
+  cvMerge (yimg, uuimg, vvimg, NULL, yuvimage);
+  cvCvtColor (yuvimage, rgbimg, CV_YCrCb2RGB);
+
+  cvReleaseImage (&uuimg);
+  cvReleaseImage (&vvimg);
+  cvReleaseImageHeader (&yimg);
+  cvReleaseImageHeader (&uimg);
+  cvReleaseImageHeader (&vimg);
+
+  cvReleaseImage (&yuvimage);
+
+  if (!rgbimg) {
+    return NULL;
+  }
+
+  return rgbimg;
+}
+
+static IplImage *
+cvCreateImageByVideoFrame (GstVideoFrame * vframe)
+{
+  IplImage *retImg;
+  guint8 *pixels = GST_VIDEO_FRAME_PLANE_DATA (vframe, 0);
+  if (vframe->info.width * 3 == vframe->info.size / vframe->info.height * 2) {
+    // seems a YUV image.
+    GST_DEBUG ("@rentao opencv, YUV->RGB image=%dx%d size=%ld",
+        vframe->info.width, vframe->info.height, vframe->info.size);
+    return YUV420_To_IplImage_Opencv (pixels, vframe->info.width,
+        vframe->info.height);
+  }
+  retImg = cvCreateImage (cvSize (vframe->info.width, vframe->info.height),
+      IPL_DEPTH_8U, 3);
+  GST_DEBUG ("@rentao opencv, image=%dx%d size=%ld", vframe->info.width,
+      vframe->info.height, vframe->info.size);
+  retImg->imageData = (char *) pixels;
+  return retImg;
+}
+
+static gboolean
+_compositor_fit_srcframe_into_view (gint sw, gint sh, gint vw, gint vh,
+    CvRect * pRect)
+{
+  if (vw > sw || vh > sh) {
+    int ow = sw;
+    int oh = sh;
+    int wx, hx;
+    SCALE_TO_JUST_FULL_COVER (ow, oh, vw, vh);
+    wx = (ow - vw) * sw / ow;
+    hx = (oh - vh) * sh / oh;
+    pRect->x = wx / 2;
+    pRect->width = vw * sw / ow;
+    pRect->y = hx / 2;
+    pRect->height = vh * sh / oh;
+    return TRUE;
+  }
+  // blend at the center.
+  pRect->x = (sw - vw) / 2;
+  pRect->width = vw;
+  pRect->y = (sh - vh) / 2;
+  pRect->height = vh;
+  return FALSE;
+}
+
 static GstFlowReturn
 gst_compositor_aggregate_frames (GstVideoAggregator * vagg, GstBuffer * outbuf)
 {
   GList *l;
   GstCompositor *self = GST_COMPOSITOR (vagg);
-  BlendFunction composite;
+//  BlendFunction composite;
   GstVideoFrame out_frame, *outframe;
+//  GstVideoFrame pad_frame;
+  IplImage *retFrame;
 
   if (!gst_video_frame_map (&out_frame, &vagg->info, outbuf, GST_MAP_WRITE)) {
     GST_WARNING_OBJECT (vagg, "Could not map output buffer");
@@ -990,55 +1245,130 @@ gst_compositor_aggregate_frames (GstVideoAggregator * vagg, GstBuffer * outbuf)
 
   outframe = &out_frame;
   /* default to blending */
-  composite = self->blend;
+//  composite = self->blend;
   /* TODO: If the frames to be composited completely obscure the background,
    * don't bother drawing the background at all. */
-  switch (self->background) {
-    case COMPOSITOR_BACKGROUND_CHECKER:
-      self->fill_checker (outframe);
-      break;
-    case COMPOSITOR_BACKGROUND_BLACK:
-      self->fill_color (outframe, 16, 128, 128);
-      break;
-    case COMPOSITOR_BACKGROUND_WHITE:
-      self->fill_color (outframe, 240, 128, 128);
-      break;
-    case COMPOSITOR_BACKGROUND_TRANSPARENT:
-    {
-      guint i, plane, num_planes, height;
-
-      num_planes = GST_VIDEO_FRAME_N_PLANES (outframe);
-      for (plane = 0; plane < num_planes; ++plane) {
-        guint8 *pdata;
-        gsize rowsize, plane_stride;
-
-        pdata = GST_VIDEO_FRAME_PLANE_DATA (outframe, plane);
-        plane_stride = GST_VIDEO_FRAME_PLANE_STRIDE (outframe, plane);
-        rowsize = GST_VIDEO_FRAME_COMP_WIDTH (outframe, plane)
-            * GST_VIDEO_FRAME_COMP_PSTRIDE (outframe, plane);
-        height = GST_VIDEO_FRAME_COMP_HEIGHT (outframe, plane);
-        for (i = 0; i < height; ++i) {
-          memset (pdata, 0, rowsize);
-          pdata += plane_stride;
-        }
+  if (self->priv->cvBackgroundImageReady2Copy == NULL) {
+    switch (self->background) {
+      case COMPOSITOR_BACKGROUND_CHECKER:
+        self->fill_checker (outframe);
+        break;
+      case COMPOSITOR_BACKGROUND_BLACK:
+        self->fill_color (outframe, 16, 128, 128);
+        break;
+      case COMPOSITOR_BACKGROUND_WHITE:
+        self->fill_color (outframe, 240, 128, 128);
+        break;
+      case COMPOSITOR_BACKGROUND_TRANSPARENT:{
+//      guint i, plane, num_planes, height;
+//
+//      num_planes = GST_VIDEO_FRAME_N_PLANES (outframe);
+//      for (plane = 0; plane < num_planes; ++plane) {
+//        guint8 *pdata;
+//        gsize rowsize, plane_stride;
+//
+//        pdata = GST_VIDEO_FRAME_PLANE_DATA (outframe, plane);
+//        plane_stride = GST_VIDEO_FRAME_PLANE_STRIDE (outframe, plane);
+//        rowsize = GST_VIDEO_FRAME_COMP_WIDTH (outframe, plane)
+//            * GST_VIDEO_FRAME_COMP_PSTRIDE (outframe, plane);
+//        height = GST_VIDEO_FRAME_COMP_HEIGHT (outframe, plane);
+//        for (i = 0; i < height; ++i) {
+//          memset (pdata, 0, rowsize);
+//          pdata += plane_stride;
+//        }
+//      }
+//
+//      /* use overlay to keep background transparent */
+//      composite = self->overlay;
+        break;
       }
-
-      /* use overlay to keep background transparent */
-      composite = self->overlay;
-      break;
     }
   }
-
   GST_OBJECT_LOCK (vagg);
+  retFrame = cvCreateImageByVideoFrame (outframe);
+  if (self->priv->cvBackgroundImageReady2Copy == NULL
+      && self->priv->cvBackgroundImage != NULL) {
+    cvResize (self->priv->cvBackgroundImage, retFrame, CV_INTER_LINEAR);
+    // save the resized background image for future used.
+    if (self->priv->cvBackgroundImageReady2Copy != NULL)
+      cvReleaseImage (&self->priv->cvBackgroundImageReady2Copy);
+    self->priv->cvBackgroundImageReady2Copy =
+        cvCreateImage (cvGetSize (retFrame), retFrame->depth,
+        retFrame->nChannels);
+    cvCopy (retFrame, self->priv->cvBackgroundImageReady2Copy, NULL);
+  } else if (self->priv->cvBackgroundImageReady2Copy != NULL) {
+    cvCopy (self->priv->cvBackgroundImageReady2Copy, retFrame, NULL);
+  }
+
   for (l = GST_ELEMENT (vagg)->sinkpads; l; l = l->next) {
     GstVideoAggregatorPad *pad = l->data;
     GstCompositorPad *compo_pad = GST_COMPOSITOR_PAD (pad);
 
     if (pad->aggregated_frame != NULL) {
-      composite (pad->aggregated_frame, compo_pad->xpos, compo_pad->ypos,
-          compo_pad->alpha, outframe);
+      IplImage *src_frame;
+      CvSize src_size;
+      CvRect src_rect;
+      gboolean expand;
+
+      src_frame = cvCreateImageByVideoFrame (pad->aggregated_frame);
+      src_size = cvGetSize (src_frame);
+      GST_DEBUG
+          ("@rentao blend from src to tat (opencv). view=%dx%d @ (%d,%d) src=%dx%d",
+          compo_pad->width, compo_pad->height, compo_pad->xpos, compo_pad->ypos,
+          src_size.width, src_size.height);
+
+      cvSetImageROI (retFrame, cvRect (compo_pad->xpos, compo_pad->ypos,
+              compo_pad->width, compo_pad->height));
+      expand =
+          _compositor_fit_srcframe_into_view (src_size.width, src_size.height,
+          compo_pad->width, compo_pad->height, &src_rect);
+      cvSetImageROI (src_frame, src_rect);
+      if (expand == TRUE) {
+        cvResize (src_frame, retFrame, CV_INTER_LINEAR);
+      } else {
+        cvCopy (src_frame, retFrame, NULL);
+      }
+      cvReleaseImage (&src_frame);
+//      if (!gst_video_frame_map (&pad_frame, &pad->buffer_vinfo, pad->buffer,
+//              GST_MAP_READ)) {
+//        GST_WARNING_OBJECT (vagg, "Could not map input buffer");
+//        return FALSE;
+//      }
+//      src_frame = cvCreateImageByVideoFrame(&pad_frame);
+//      cvSetImageROI (src_frame, cvRect (0, 60, 648, 360));
+//      cvResize (src_frame, retFrame, CV_INTER_LINEAR);
+//      cvReleaseImage (&src_frame);
+//      gst_video_frame_unmap (&pad_frame);
+
+//      if (1 == 0)
+//        composite (pad->aggregated_frame, compo_pad->xpos, compo_pad->ypos,
+//            compo_pad->alpha, outframe);
     }
   }
+  cvReleaseImage (&retFrame);
+//  GST_DEBUG("@rentao try to use opencv start.");
+//  if (1==0) {
+//    IplImage *outputImg;
+//    guint8 *pixels = GST_VIDEO_FRAME_PLANE_DATA (outframe, 0);
+//    guint stride = GST_VIDEO_FRAME_PLANE_STRIDE (outframe, 0);
+////    guint pixel_stride = GST_VIDEO_FRAME_PLANE_PSTRIDE (outframe, 0);
+//    GST_DEBUG("@rentao try to use opencv start. %d", stride);
+////    GstMapInfo info;
+//    GST_DEBUG("@rentao try to use opencv.");
+////    gst_buffer_map (outframe->buffer, &info, GST_MAP_READ);
+////    GST_DEBUG("@rentao try to use opencv. %d, %d", outframe->info.width, outframe->info.height);
+//    outputImg = cvCreateImage (cvSize (outframe->info.width, outframe->info.height),
+//            IPL_DEPTH_8U, 3);
+//    GST_DEBUG("@rentao try to use opencv.");
+//    outputImg->imageData = (char *) pixels/*outframe->data*/;
+////    GST_DEBUG("@rentao try to use opencv.");
+//    cvRectangle(outputImg, cvPoint(110,110), cvPoint(600, 700), CV_RGB (0,0,0), CV_FILLED, 8, 0);
+////    GST_DEBUG("@rentao try to use opencv.");
+//    cvReleaseImage (&outputImg);
+////    gst_buffer_unmap (outframe->buffer, &info);
+//  }
+//  GST_TRACE("@rentao try to use opencv. end");
+
   GST_OBJECT_UNLOCK (vagg);
 
   gst_video_frame_unmap (outframe);
@@ -1088,6 +1418,21 @@ _sink_query (GstAggregator * agg, GstAggregatorPad * bpad, GstQuery * query)
   }
 }
 
+static void
+gst_compositor_finalize (GObject * object)
+{
+  GstCompositor *self = GST_COMPOSITOR (object);
+
+  if (self->priv->cvBackgroundImage != NULL)
+    cvReleaseImage (&self->priv->cvBackgroundImage);
+  if (self->priv->cvBackgroundImageReady2Copy != NULL)
+    cvReleaseImage (&self->priv->cvBackgroundImageReady2Copy);
+  self->priv->cvBackgroundImage = NULL;
+  self->priv->cvBackgroundImageReady2Copy = NULL;
+
+  G_OBJECT_CLASS (gst_compositor_parent_class)->finalize (object);
+}
+
 /* GObject boilerplate */
 static void
 gst_compositor_class_init (GstCompositorClass * klass)
@@ -1100,9 +1445,13 @@ gst_compositor_class_init (GstCompositorClass * klass)
 
   gobject_class->get_property = gst_compositor_get_property;
   gobject_class->set_property = gst_compositor_set_property;
+  gobject_class->finalize = gst_compositor_finalize;
 
   agg_class->sinkpads_type = GST_TYPE_COMPOSITOR_PAD;
   agg_class->sink_query = _sink_query;
+#if 0
+  videoaggregator_class->update_caps = _update_caps;
+#endif
   videoaggregator_class->fixate_caps = _fixate_caps;
   videoaggregator_class->negotiated_caps = _negotiated_caps;
   videoaggregator_class->aggregate_frames = gst_compositor_aggregate_frames;
@@ -1111,6 +1460,21 @@ gst_compositor_class_init (GstCompositorClass * klass)
       g_param_spec_enum ("background", "Background", "Background type",
           GST_TYPE_COMPOSITOR_BACKGROUND,
           DEFAULT_BACKGROUND, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_WIDTH,
+      g_param_spec_int ("width", "Width",
+          "Fixed width of output screen (0 = expandable by the content)",
+          0, G_MAXINT, 0, G_PARAM_READWRITE));
+  g_object_class_install_property (gobject_class, PROP_HEIGHT,
+      g_param_spec_int ("height", "Height",
+          "Fixed height of output screen (0 = expandable by the content)",
+          0, G_MAXINT, 0, G_PARAM_READWRITE));
+  g_object_class_install_property (gobject_class, PROP_BACKGROUND_IMAGE,
+      g_param_spec_string ("background-image",
+          "Background Image show at the episode",
+          "Background Image local file path",
+          DEFAULT_BACKGROUND_IMAGE,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   gst_element_class_add_pad_template (gstelement_class,
       gst_static_pad_template_get (&src_factory));
@@ -1121,13 +1485,22 @@ gst_compositor_class_init (GstCompositorClass * klass)
       "Filter/Editor/Video/Compositor",
       "Composite multiple video streams", "Wim Taymans <wim@fluendo.com>, "
       "Sebastian Dröge <sebastian.droege@collabora.co.uk>");
+
+  /* Registers a private structure for the instantiatable type */
+  g_type_class_add_private (klass, sizeof (GstCompositorPrivate));
+  GST_TRACE ("@rentao");
 }
 
 static void
 gst_compositor_init (GstCompositor * self)
 {
+  self->priv = GST_COMPOSITOR_GET_PRIVATE (self);
   self->background = DEFAULT_BACKGROUND;
+  self->background_image = NULL;
+  self->priv->cvBackgroundImage = NULL;
+  self->priv->cvBackgroundImageReady2Copy = NULL;
   /* initialize variables */
+  GST_TRACE ("@rentao");
 }
 
 /* Element registration */
@@ -1138,6 +1511,7 @@ plugin_init (GstPlugin * plugin)
 
   gst_compositor_init_blend ();
 
+  GST_TRACE ("@rentao");
   return gst_element_register (plugin, "compositor", GST_RANK_PRIMARY + 1,
       GST_TYPE_COMPOSITOR);
 }

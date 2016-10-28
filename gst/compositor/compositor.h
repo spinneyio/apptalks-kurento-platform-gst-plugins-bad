@@ -60,6 +60,7 @@ typedef enum
 }
 GstCompositorBackground;
 
+typedef struct _GstCompositorPrivate GstCompositorPrivate;
 /**
  * GstCompositor:
  *
@@ -69,6 +70,10 @@ struct _GstCompositor
 {
   GstVideoAggregator videoaggregator;
   GstCompositorBackground background;
+  gint output_width;
+  gint output_height;
+  gchar* background_image;
+  GstCompositorPrivate* priv;
 
   BlendFunction blend, overlay;
   FillCheckerFunction fill_checker;
