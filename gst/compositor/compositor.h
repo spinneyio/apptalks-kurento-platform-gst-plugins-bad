@@ -72,6 +72,7 @@ struct _GstCompositor
   GstCompositorBackground background;
   gint output_width;
   gint output_height;
+  gint frame_rate;
   gchar* background_image;
   GstCompositorPrivate* priv;
 

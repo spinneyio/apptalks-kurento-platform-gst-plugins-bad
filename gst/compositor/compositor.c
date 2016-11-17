@@ -711,6 +711,7 @@ enum
   PROP_BACKGROUND,
   PROP_WIDTH,
   PROP_HEIGHT,
+  PROP_FRAME_RATE,
   PROP_BACKGROUND_IMAGE
 };
 #define DEFAULT_BACKGROUND_IMAGE NULL
@@ -754,6 +755,9 @@ gst_compositor_get_property (GObject * object,
     case PROP_HEIGHT:
       g_value_set_int (value, self->output_height);
       break;
+    case PROP_FRAME_RATE:
+      g_value_set_int (value, self->frame_rate);
+      break;
     case PROP_BACKGROUND_IMAGE:
     {
       g_value_set_string (value, self->background_image);
@@ -780,6 +784,9 @@ gst_compositor_set_property (GObject * object,
       break;
     case PROP_HEIGHT:
       self->output_height = g_value_get_int (value);
+      break;
+    case PROP_FRAME_RATE:
+      self->frame_rate = g_value_get_int (value);
       break;
     case PROP_BACKGROUND_IMAGE:
       GST_OBJECT_LOCK (self);
@@ -975,6 +982,7 @@ _fixate_caps (GstVideoAggregator * vagg, GstCaps * caps)
   gint best_width = -1, best_height = -1;
   gint best_fps_n = -1, best_fps_d = -1;
   gint par_n, par_d;
+  gint vagg_width = 0, vagg_height = 0, vagg_frame_rate = 0;
   gdouble best_fps = 0.;
   GstCaps *ret = NULL;
   GstStructure *s;
@@ -1038,9 +1046,22 @@ _fixate_caps (GstVideoAggregator * vagg, GstCaps * caps)
     best_fps_d = 1;
     best_fps = 25.0;
   }
-  // set best output resolution to the size StyleComposite had set.
-  g_object_get (G_OBJECT (vagg), "width", &best_width, "height",
-      &best_height, NULL);
+  // set best output resolution and frame rate to the size StyleComposite had set.
+  g_object_get (G_OBJECT (vagg), "width", &vagg_width, "height",
+      &vagg_height, "frame-rate", &vagg_frame_rate, NULL);
+
+  GST_TRACE_OBJECT (vagg, "vagg_width=%d, vagg_height=%d, vagg_frame_rate=%d",
+      vagg_width, vagg_height, vagg_frame_rate);
+  GST_TRACE_OBJECT (vagg, "vagg_width=%d, vagg_height=%d, vagg_frame_rate=%d",
+      vagg_width, vagg_height, vagg_frame_rate);
+  if (vagg_width > 0 && vagg_height > 0) {
+    best_width = vagg_width;
+    best_height = vagg_height;
+  }
+  if (vagg_frame_rate > 0) {
+    best_fps_n = vagg_frame_rate;
+    best_fps_d = 1;
+  }
 
   gst_structure_fixate_field_nearest_int (s, "width", best_width);
   gst_structure_fixate_field_nearest_int (s, "height", best_height);
@@ -1092,7 +1113,6 @@ _update_caps (GstVideoAggregator * vagg, GstCaps * caps)
     gint this_width, this_height;
     gint width, height;
 
-    GST_TRACE ("@rentao");
     _mixer_pad_get_output_size (GST_COMPOSITOR (vagg), compositor_pad, &width,
         &height);
 
@@ -1111,9 +1131,10 @@ _update_caps (GstVideoAggregator * vagg, GstCaps * caps)
       &output_height, NULL);
   GST_OBJECT_UNLOCK (vagg);
 
-  GST_TRACE
-      ("@rentao best-width=%d, best-height=%d, ow=%d, oh=%d, o_w=%d, o_h=%d",
-      best_width, best_height, GST_VIDEO_INFO_WIDTH (&vagg->info),
+  GST_TRACE_OBJECT
+      (compositor_pad,
+      "best-width=%d, best-height=%d, ow=%d, oh=%d, o_w=%d, o_h=%d", best_width,
+      best_height, GST_VIDEO_INFO_WIDTH (&vagg->info),
       GST_VIDEO_INFO_HEIGHT (&vagg->info), output_width, output_height);
 
   if (best_width > 0 && best_height > 0) {
@@ -1434,6 +1455,10 @@ gst_compositor_class_init (GstCompositorClass * klass)
       g_param_spec_int ("height", "Height",
           "Fixed height of output screen (0 = expandable by the content)",
           0, G_MAXINT, 0, G_PARAM_READWRITE));
+  g_object_class_install_property (gobject_class, PROP_FRAME_RATE,
+      g_param_spec_int ("frame-rate", "Frame Rate",
+          "Fixed frame rate of output screen (0 = expandable by the content)",
+          0, G_MAXINT, 0, G_PARAM_READWRITE));
   g_object_class_install_property (gobject_class, PROP_BACKGROUND_IMAGE,
       g_param_spec_string ("background-image",
           "Background Image show at the episode",
@@ -1461,6 +1486,7 @@ static void
 gst_compositor_init (GstCompositor * self)
 {
   self->priv = GST_COMPOSITOR_GET_PRIVATE (self);
+  self->frame_rate = 0;
   self->background = DEFAULT_BACKGROUND;
   self->background_image = NULL;
   self->priv->cvBackgroundImage = NULL;
