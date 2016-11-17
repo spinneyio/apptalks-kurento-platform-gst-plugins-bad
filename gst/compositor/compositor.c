@@ -256,9 +256,10 @@ _mixer_pad_get_output_size (GstCompositor * comp,
   pad_height = *height;
   *width = GST_VIDEO_INFO_WIDTH (&vagg_pad->info);
   *height = GST_VIDEO_INFO_HEIGHT (&vagg_pad->info);
-  GST_TRACE
-      ("@rentao return-width=%d, return-height=%d, pad_width=%d, pad_height=%d",
-      *width, *height, pad_width, pad_height);
+  GST_TRACE_OBJECT
+      (comp_pad,
+      "return-width=%d, return-height=%d, pad_width=%d, pad_height=%d", *width,
+      *height, pad_width, pad_height);
 
   return;
 
@@ -1025,8 +1026,9 @@ _fixate_caps (GstVideoAggregator * vagg, GstCaps * caps)
       best_fps_n = fps_n;
       best_fps_d = fps_d;
     }
-    GST_TRACE
-        ("@rentao best-width=%d, best-height=%d, best_fps_n=%d, best_fps_d=%d",
+    GST_TRACE_OBJECT
+        (compositor_pad,
+        "@rentao best-width=%d, best-height=%d, best_fps_n=%d, best_fps_d=%d",
         best_width, best_height, best_fps_n, best_fps_d);
   }
   GST_OBJECT_UNLOCK (vagg);
@@ -1046,9 +1048,6 @@ _fixate_caps (GstVideoAggregator * vagg, GstCaps * caps)
       best_fps_d);
   ret = gst_caps_fixate (ret);
 
-  GST_TRACE
-      ("@rentao final, best-width=%d, best-height=%d, best_fps_n=%d, best_fps_d=%d",
-      best_width, best_height, best_fps_n, best_fps_d);
   GST_DEBUG_OBJECT (vagg, "final caps %" GST_PTR_FORMAT, ret);
   return ret;
 }
@@ -1190,14 +1189,14 @@ cvCreateImageByVideoFrame (GstVideoFrame * vframe)
   guint8 *pixels = GST_VIDEO_FRAME_PLANE_DATA (vframe, 0);
   if (vframe->info.width * 3 == vframe->info.size / vframe->info.height * 2) {
     // seems a YUV image.
-    GST_DEBUG ("@rentao opencv, YUV->RGB image=%dx%d size=%ld",
+    GST_DEBUG_OBJECT (vframe, "opencv, YUV->RGB image=%dx%d size=%ld",
         vframe->info.width, vframe->info.height, vframe->info.size);
     return YUV420_To_IplImage_Opencv (pixels, vframe->info.width,
         vframe->info.height);
   }
   retImg = cvCreateImage (cvSize (vframe->info.width, vframe->info.height),
       IPL_DEPTH_8U, 3);
-  GST_DEBUG ("@rentao opencv, image=%dx%d size=%ld", vframe->info.width,
+  GST_DEBUG_OBJECT (vframe, "opencv, image=%dx%d size=%ld", vframe->info.width,
       vframe->info.height, vframe->info.size);
   retImg->imageData = (char *) pixels;
   return retImg;
@@ -1312,8 +1311,9 @@ gst_compositor_aggregate_frames (GstVideoAggregator * vagg, GstBuffer * outbuf)
 
       src_frame = cvCreateImageByVideoFrame (pad->aggregated_frame);
       src_size = cvGetSize (src_frame);
-      GST_DEBUG
-          ("@rentao blend from src to tat (opencv). view=%dx%d @ (%d,%d) src=%dx%d",
+      GST_DEBUG_OBJECT
+          (compo_pad,
+          "blend from src to tat (opencv). view=%dx%d @ (%d,%d) src=%dx%d",
           compo_pad->width, compo_pad->height, compo_pad->xpos, compo_pad->ypos,
           src_size.width, src_size.height);
 
@@ -1329,45 +1329,9 @@ gst_compositor_aggregate_frames (GstVideoAggregator * vagg, GstBuffer * outbuf)
         cvCopy (src_frame, retFrame, NULL);
       }
       cvReleaseImage (&src_frame);
-//      if (!gst_video_frame_map (&pad_frame, &pad->buffer_vinfo, pad->buffer,
-//              GST_MAP_READ)) {
-//        GST_WARNING_OBJECT (vagg, "Could not map input buffer");
-//        return FALSE;
-//      }
-//      src_frame = cvCreateImageByVideoFrame(&pad_frame);
-//      cvSetImageROI (src_frame, cvRect (0, 60, 648, 360));
-//      cvResize (src_frame, retFrame, CV_INTER_LINEAR);
-//      cvReleaseImage (&src_frame);
-//      gst_video_frame_unmap (&pad_frame);
-
-//      if (1 == 0)
-//        composite (pad->aggregated_frame, compo_pad->xpos, compo_pad->ypos,
-//            compo_pad->alpha, outframe);
     }
   }
   cvReleaseImage (&retFrame);
-//  GST_DEBUG("@rentao try to use opencv start.");
-//  if (1==0) {
-//    IplImage *outputImg;
-//    guint8 *pixels = GST_VIDEO_FRAME_PLANE_DATA (outframe, 0);
-//    guint stride = GST_VIDEO_FRAME_PLANE_STRIDE (outframe, 0);
-////    guint pixel_stride = GST_VIDEO_FRAME_PLANE_PSTRIDE (outframe, 0);
-//    GST_DEBUG("@rentao try to use opencv start. %d", stride);
-////    GstMapInfo info;
-//    GST_DEBUG("@rentao try to use opencv.");
-////    gst_buffer_map (outframe->buffer, &info, GST_MAP_READ);
-////    GST_DEBUG("@rentao try to use opencv. %d, %d", outframe->info.width, outframe->info.height);
-//    outputImg = cvCreateImage (cvSize (outframe->info.width, outframe->info.height),
-//            IPL_DEPTH_8U, 3);
-//    GST_DEBUG("@rentao try to use opencv.");
-//    outputImg->imageData = (char *) pixels/*outframe->data*/;
-////    GST_DEBUG("@rentao try to use opencv.");
-//    cvRectangle(outputImg, cvPoint(110,110), cvPoint(600, 700), CV_RGB (0,0,0), CV_FILLED, 8, 0);
-////    GST_DEBUG("@rentao try to use opencv.");
-//    cvReleaseImage (&outputImg);
-////    gst_buffer_unmap (outframe->buffer, &info);
-//  }
-//  GST_TRACE("@rentao try to use opencv. end");
 
   GST_OBJECT_UNLOCK (vagg);
 
@@ -1442,6 +1406,7 @@ gst_compositor_class_init (GstCompositorClass * klass)
   GstVideoAggregatorClass *videoaggregator_class =
       (GstVideoAggregatorClass *) klass;
   GstAggregatorClass *agg_class = (GstAggregatorClass *) klass;
+  GST_INFO ("@rentao version:6.6.1-debug-frozen");
 
   gobject_class->get_property = gst_compositor_get_property;
   gobject_class->set_property = gst_compositor_set_property;
@@ -1483,12 +1448,13 @@ gst_compositor_class_init (GstCompositorClass * klass)
 
   gst_element_class_set_static_metadata (gstelement_class, "Compositor",
       "Filter/Editor/Video/Compositor",
-      "Composite multiple video streams", "Wim Taymans <wim@fluendo.com>, "
+      "Composite multiple video streams",
+      "Tao Ren <tao@swarmnyc.com>, "
+      "Wim Taymans <wim@fluendo.com>, "
       "Sebastian Dröge <sebastian.droege@collabora.co.uk>");
 
   /* Registers a private structure for the instantiatable type */
   g_type_class_add_private (klass, sizeof (GstCompositorPrivate));
-  GST_TRACE ("@rentao");
 }
 
 static void
@@ -1500,7 +1466,6 @@ gst_compositor_init (GstCompositor * self)
   self->priv->cvBackgroundImage = NULL;
   self->priv->cvBackgroundImageReady2Copy = NULL;
   /* initialize variables */
-  GST_TRACE ("@rentao");
 }
 
 /* Element registration */
@@ -1511,7 +1476,6 @@ plugin_init (GstPlugin * plugin)
 
   gst_compositor_init_blend ();
 
-  GST_TRACE ("@rentao");
   return gst_element_register (plugin, "compositor", GST_RANK_PRIMARY + 1,
       GST_TYPE_COMPOSITOR);
 }
