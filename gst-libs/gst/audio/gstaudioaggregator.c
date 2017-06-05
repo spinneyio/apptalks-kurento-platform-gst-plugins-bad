@@ -178,8 +178,8 @@ static GstFlowReturn gst_audio_aggregator_aggregate (GstAggregator * agg,
 static gboolean sync_pad_values (GstAudioAggregator * aagg,
     GstAudioAggregatorPad * pad);
 
-#define DEFAULT_OUTPUT_BUFFER_DURATION (10 * GST_MSECOND)
-#define DEFAULT_ALIGNMENT_THRESHOLD   (40 * GST_MSECOND)
+#define DEFAULT_OUTPUT_BUFFER_DURATION (150 * GST_MSECOND)
+#define DEFAULT_ALIGNMENT_THRESHOLD   (600 * GST_MSECOND)
 #define DEFAULT_DISCONT_WAIT (1 * GST_SECOND)
 
 enum
